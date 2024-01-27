@@ -1,0 +1,294 @@
+---
+title: "Project-Group6-FlickRImageClassifier"
+author: "Gokul Nedunsezhian, Jai Krishna Mounaguru, Rohit Madhu, Rohan Pathak"
+date: "2023-04-25"
+output: html_document
+---
+
+## Problem Description
+
+## Link to Scrapped Data
+
+```{r setup, include=FALSE}
+# Load required libraries
+library(tidyverse)
+library(keras)
+library(tensorflow)
+library(reticulate)
+library(yardstick)
+library(pROC)
+```
+
+## Specifying food items & directory
+
+Use FlickR API to search for the 5000 most interesting pictures in each catogory and download them 
+```{r,eval=FALSE}
+# Specify the food items to download
+food_items <- c("burger", "banana", "apple", "pasta")
+
+# Specify the directory to save the images
+dir.create("training_data")
+local_dir <- "training_data"
+
+```
+
+Loop through the food items and download the images
+
+```{r,eval=FALSE}
+# Loop through each food item
+for (food_item in food_items) {
+  # Create a subdirectory for this food item
+  sub_dir <- paste(local_dir, "/", food_item, sep = "")
+  dir.create(sub_dir)
+  
+  # Specify the number of images to download for this food item
+  n_images <- 5500
+  
+  # Specify the number of images to download per request
+  per_page <- 500
+  
+  # Specify the number of requests needed
+  n_requests <- ceiling(n_images / per_page)
+  
+  # Loop through each request
+  for (page in 1:n_requests) {
+    # Calculate the starting index for this request
+    start <- (page - 1) * per_page + 1
+    
+    # Make the API request for this page
+    photos <- getPhotoSearch(api_key = "a78a61870fb226f1aa6e348cd78c075e",
+                             tags = food_item,
+                             extras = "url_o",
+                             img_size = "m",
+                             per_page = per_page,
+                             page = page,
+                             sort = "interestingness-desc")
+    
+    # Remove columns with NA values in url_o column
+    photos <- subset(photos, !is.na(url_m))
+    
+    # Loop through each row in the dataframe for this request
+    for (i in 1:nrow(photos)) {
+      # Get the URL for the current photo
+      url <- photos$url_m[i]
+      
+      # Extract the photo ID from the URL
+      photo_id <- gsub(".*/", "", url)
+      
+      # Calculate the index of this photo
+      index <- start + i - 1
+      
+      # Construct the filename by concatenating the index and the photo ID
+      filename <- paste(sub_dir, "/", index, "-", photo_id, ".jpg", sep = "")
+      
+      # Try to download the photo, and skip if there is an error
+      tryCatch(
+        download.file(url, filename),
+        error = function(e) {
+          message(sprintf("Error downloading photo %s: %s", photo_id, e$message))
+        }
+      )
+      
+      # Stop the loop if we've reached the desired number of images
+      if (index >= n_images) {
+        break
+      }
+    }
+  }
+}
+
+```
+
+## Model Building
+Getting the labels for data, Set the image dimensions & set up image data generator
+```{r}
+# Get the list of labels for each class
+label_list <- dir("train/")
+output_n <- length(label_list)
+# Save the list of labels to a file
+save(label_list, file="label_list.R")
+
+# Set the dimensions for the input images
+width <- 224
+height<- 224
+target_size <- c(width, height)
+rgb <- 3 #color channels
+
+# Specify the path to the training data and create a data generator
+path_train <- "train3/"
+train_data_gen <- image_data_generator(rescale = 1/255, 
+                                       validation_split = .6)
+```
+
+
+Set up genarator for Training and Test images
+
+```{r}
+# Create a generator for the training images
+train_images <- flow_images_from_directory(path_train,
+                                           train_data_gen,
+                                           subset = 'training',
+                                           target_size = target_size,
+                                           class_mode = "categorical",
+                                           shuffle = TRUE,
+                                           batch_size = 32,
+                                           classes = label_list,
+                                           seed = 2021)
+
+# Create a generator for the validation images
+validation_images <- flow_images_from_directory(path_train,
+                                         train_data_gen,
+                                         subset = "validation",
+                                         target_size = target_size,
+                                         class_mode = "categorical",
+                                         shuffle = TRUE,
+                                         batch_size = 32,
+                                         classes = label_list,
+                                         seed = 2021)
+```
+
+Define a sequential model for image classification using transfer learning with the pre-trained Xception model as the base. The base model is loaded with weights from the ImageNet dataset.
+Its layers are frozen to prevent them from being updated during training. 
+
+
+
+```{r,eval=FALSE}
+
+mod_base <- application_xception(weights = 'imagenet', 
+                                 include_top = FALSE, input_shape = c(width, height, 3))
+freeze_weights(mod_base) 
+
+model_function <- function(learning_rate = 0.001, 
+                           dropoutrate=0.2, n_dense=1024){
+  
+  k_clear_session() # Clear any existing models in memory
+  
+  # Create a sequential model and add the pre-trained Xception model as the base
+  model <- keras_model_sequential() %>%
+    mod_base %>% 
+    # Add a global average pooling layer to reduce the number of parameters
+    layer_global_average_pooling_2d() %>% 
+    # Add a dense layer with the specified number of units
+    layer_dense(units = n_dense) %>%
+    # Add a ReLU activation function
+    layer_activation("relu") %>%
+    # Add a dropout layer to prevent overfitting
+    layer_dropout(dropoutrate) %>%
+    # Add a final dense layer with the number of output classes and a softmax activation function
+    layer_dense(units=output_n, activation="softmax")
+  
+  # Compile the model with categorical cross-entropy loss, Adam optimizer and accuracy metric
+  model %>% compile(
+    loss = "categorical_crossentropy",
+    optimizer = optimizer_adam(lr = learning_rate),
+    metrics = "accuracy"
+  )
+  
+  # Return the compiled model
+  return(model)
+  
+}
+```
+
+The Model is further trained on the training data
+
+  
+
+```{r,eval=FALSE}
+history <- model %>% fit(
+  train_images,
+  class_mode = "categorical",
+  classes = label_list,
+  epochs = 2, # modify the number of epochs if necessary
+  validation_data = validation_images
+)
+```
+
+
+
+Deploy the Model & Save it 
+
+```{r,eval=FALSE}
+
+# Create the neural network model using default parameter values
+model <- model_function()
+
+```
+
+Load the model
+
+```{r}
+# Load the model
+model <- load_model_hdf5("Project-Group6-FlickRImageClassifier.h5")
+```
+
+Test the Accuracy of the model using the Test data
+
+```{r}
+path_test <- "test"
+test_data_gen <- image_data_generator(rescale = 1/255)
+test_images <- flow_images_from_directory(path_test,
+                                          test_data_gen,
+                                          target_size = target_size,
+                                          class_mode = "categorical",
+                                          classes = label_list,
+                                          shuffle = F,
+                                          seed = 2021)
+
+model %>% evaluate_generator(test_images, 
+                             steps = test_images$n)
+```
+```{r}
+# Make predictions on test images
+pred <- predict(model, test_images)
+
+# Get predicted labels
+pred_labels <- label_list[apply(pred, 1, which.max)]
+
+# Get true labels
+true_labels <- test_images$classes
+
+# Create confusion matrix
+conf_mat <- table(pred_labels, true_labels)
+
+# Print confusion matrix
+print(conf_mat)
+
+```
+
+### Testing a custom image downloaded from a google search 
+
+
+```{r}
+
+library(knitr)
+
+# Load test image
+test_image <- image_load("PourHouseAmericanBurger.webp",
+                         target_size = target_size)
+
+
+# Preprocess image
+x <- image_to_array(test_image)
+x <- array_reshape(x, c(1, dim(x)))
+x <- x/255
+
+
+# Make predictions and create a data frame
+pred <- model %>% predict(x)
+
+Probability = t(pred)
+
+
+pred_df <- data.frame("Food" = label_list, Probability)
+pred_df <- pred_df[order(pred_df$Probability, decreasing = TRUE),][1:4,]
+pred_df$Probability <- paste0(format(round(100*as.numeric(pred_df$Probability), 2), nsmall = 2), " %")
+pred_df <- pred_df[complete.cases(pred_df), ]
+
+# Display results in a table
+library(knitr)
+kable(pred_df, align = "c", row.names = FALSE, col.names = c("", "Probability"))
+
+```
+
+
